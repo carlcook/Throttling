@@ -13,6 +13,7 @@ const int MaxOperationsToGenerateAtATime = 10;
 const double LikelyhoodOfBeingThrottled = 0.15;
 const int MaxOperationsToAcknowledge = 10;
 const int UpperPrice = 9;
+const int UpperVolume = 100;
 
 enum class Action
 {
@@ -415,7 +416,7 @@ int RandomPrice()
 
 int RandomQty()
 {
-  std::uniform_int_distribution<> distribution(1, 100);
+  std::uniform_int_distribution<> distribution(1, UpperVolume);
   return distribution(random_engine);
 }
 
