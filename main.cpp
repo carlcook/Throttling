@@ -34,8 +34,8 @@ enum class OrderState
 {
   PriorToMarket,
   OnMarket,
-  Deleting,
-  Deleted
+  DeleteSentToMarket, // delete sent to market
+  Finalised // gone
 };
 
 enum class OperationType
@@ -88,25 +88,41 @@ struct Order
 };
 
 std::ostream& operator<<(std::ostream& stream, const Operation& operation)
-  {
-    static std::map<OperationType, std::string> typeMap {
-      {OperationType::InsertOrder, "InsertOrder"},
-      {OperationType::InsertQuote, "InsertQuote"},
-      {OperationType::AmendOrder, "AmendOrder"},
-      {OperationType::DeleteOrder, "DeleteOrder"},
-      {OperationType::DeleteQuote, "DeleteQuote"}
-      };
-    static std::map<OperationState, std::string> stateMap {
-      {OperationState::Initial, "Initial"},
-      {OperationState::SentToMarket, "SentToMarket"},
-      {OperationState::Queued, "Queued"},
-      {OperationState::Acked, "Acked"}
-    };
+{
+  static std::map<OperationType, std::string> typeMap {
+    {OperationType::InsertOrder, "InsertOrder"},
+    {OperationType::InsertQuote, "InsertQuote"},
+    {OperationType::AmendOrder, "AmendOrder"},
+    {OperationType::DeleteOrder, "DeleteOrder"},
+    {OperationType::DeleteQuote, "DeleteQuote"}
+  };
+  static std::map<OperationState, std::string> stateMap {
+    {OperationState::Initial, "Initial"},
+    {OperationState::SentToMarket, "SentToMarket"},
+    {OperationState::Queued, "Queued"},
+    {OperationState::Acked, "Acked"}
+  };
 
-    stream << "Type: " << typeMap[operation.operationType] << ", state: " << stateMap[operation.operationState] << ", Side: "
-           << (operation.order.side == Side::Buy ? "Buy" : "Sell") << ", " << operation.qty << "@" << operation.price;
-    return stream;
-  }
+  stream << "Type: " << typeMap[operation.operationType] << ", state: " << stateMap[operation.operationState]
+         << ", " << operation.qty << "@" << operation.price;
+  return stream;
+}
+
+std::ostream& operator<<(std::ostream& stream, const Order& order)
+{
+  static std::map<OrderState, std::string> stateMap {
+    {OrderState::PriorToMarket, "PriorToMarket"},
+    {OrderState::OnMarket, "OnMarket"},
+    {OrderState::DeleteSentToMarket, "DeleteSentToMarket"},
+    {OrderState::Finalised, "Finalised"}
+  };
+
+  stream << "State: " << stateMap[order.orderState] << ", Side: " << (order.side == Side::Buy ? "Buy" : "Sell")
+         << ", " << order.qty << "@" << order.price << ", operations: ";
+  for (auto& operation : order.operations)
+    stream << "[ " << *operation.get() << " ]";
+  return stream;
+}
 
 struct Quote
 {
@@ -120,6 +136,10 @@ struct Quote
 std::vector<std::unique_ptr<Order>> orders;
 std::vector<std::unique_ptr<Quote>> quotes;
 std::vector<Operation*> throttle; // just references to managed objects
+int lastQuoteBidQty = -1;
+int lastQuoteBidPrice = -1;
+int lastQuoteAskQty = -1;
+int lastQuoteAskPrice = -1;
 
 std::random_device random_device;
 std::default_random_engine random_engine(random_device());
@@ -127,52 +147,78 @@ std::default_random_engine random_engine(random_device());
 template <typename C>
 int GetLivePrice(C comparitor, Order& order)
 {
-  int price = order.price;
+  int inflightPrice = order.price;
+  int lastAckedPrice = order.price;
   for (auto& operation : order.operations)
   {
-    if (operation->operationState != OperationState::Acked)
+    if (operation->operationType == OperationType::AmendOrder || operation->operationType == OperationType::InsertOrder)
     {
-      if (operation->operationType == OperationType::AmendOrder)
+      if (operation->operationState == OperationState::Acked)
       {
-        price = comparitor(operation->price, price);
+        // the very latest ack price should be taken into account
+        lastAckedPrice = operation->price;
+      }
+      else
+      {
+        // take any pending price into account
+        inflightPrice = comparitor(operation->price, inflightPrice);
       }
     }
   }
-  return price;
+  return comparitor(inflightPrice, lastAckedPrice);
 }
 
-bool NotInCross(Order& order1, Order& order2)
+bool CheckPendingInsertOrAmend(Order& pendingOrder)
 {
-  if (order1.side == order2.side)
-    return true;
-  if (order1.orderState == OrderState::Deleted)
-    return true; // can't be in cross if order is gone
-  if (order2.orderState == OrderState::Deleted)
-    return true; // can't be in cross if order is gone
+  // check quotes first
+  if (pendingOrder.side == Side::Buy)
+  {
+    if (lastQuoteAskQty > -1)
+    {
+      int pendingBuyPrice = GetLivePrice([](int a, int b) { return std::max(a, b); }, pendingOrder);
+      if (pendingBuyPrice >= lastQuoteAskQty)
+      {
+        return false; // will cross with quote
+      }
+    }
+  }
+  else // ask
+  {
+    if (lastQuoteBidQty > -1)
+    {
+      int pendingAskPrice = GetLivePrice([](int a, int b) { return std::min(a, b); }, pendingOrder);
+      if (pendingAskPrice <= lastQuoteBidQty)
+      {
+        return false; // will cross with quote
+      }
+    }
+  }
 
-  // TODO check global quote state
-
-  // Oo through all order amend operations that are pending
-  if (order1.side == Side::Buy)
-    return GetLivePrice([](int a, int b) { return std::max(a, b); }, order1) < GetLivePrice([](int a, int b){return std::max(a, b);}, order2);
-  else
-    return GetLivePrice([](int a, int b) { return std::min(a, b); }, order1) > GetLivePrice([](int a, int b){return std::min(a, b);}, order2);
-}
-
-bool CheckInsert(Order& insertedOrder)
-{
   // walk through all opposing orders and check that not in cross
   for (auto& order: orders)
   {
-      if (order.get() == &insertedOrder)
+    if (order->side == pendingOrder.side)
+      continue; // same order
+    if (order->orderState == OrderState::Finalised)
+      continue; // can't be in cross if other order is gone
+    if (order->orderState == OrderState::DeleteSentToMarket)
+      continue; // can't be in cross if other order is going
+
+    if (pendingOrder.side == Side::Buy) // order must be opposing side if we are here
+    {
+      int pendingBuy = GetLivePrice([](int a, int b) { return std::max(a, b); }, pendingOrder);
+      int minSubmittedSell = GetLivePrice([](int a, int b){return std::min(a, b);}, *order.get());
+      if (pendingBuy < minSubmittedSell)
         continue;
-      if (order->orderState == OrderState::Deleted)
+    }
+    else // order must be opposing side if we are here
+    {
+      int pendingSell = GetLivePrice([](int a, int b) { return std::min(a, b); }, pendingOrder);
+      int maxSubmittedBuy = GetLivePrice([](int a, int b){return std::max(a, b);}, *order.get());
+      if (pendingSell > maxSubmittedBuy)
         continue;
-      if (order->side == insertedOrder.side)
-        continue;
-      if (NotInCross(*order, insertedOrder))
-        continue;
-      return false;
+    }
+    return false;
   }
   return true;
 }
@@ -185,18 +231,57 @@ bool CheckThrottle()
   return distribution(random_engine);
 }
 
+void RemoveFromThrottle(Order* order)
+{
+  throttle.erase(std::remove_if(throttle.begin(), throttle.end(), [order](const Operation* operation)
+  {
+    if (&operation->order == order)
+    {
+      std::cout << "Removing operation from throttle: " << *operation << std::endl;
+      return true;
+    }
+    return false;
+  }), throttle.end());
+}
+
+void RemoveDiscardedOperations(Operation& operation)
+{
+  auto& operations = operation.order.operations;
+  Operation* thisOperation = &operation;
+  bool flag = true;
+  operations.erase(std::remove_if(operations.begin(), operations.end(), [thisOperation, &flag](const std::unique_ptr<Operation>& ptr)
+  {
+    if (ptr.get() != thisOperation)
+    {
+      if (ptr->operationState == OperationState::Queued)
+      {
+          if (flag)
+            thisOperation->previousOperation = ptr->previousOperation;
+          flag = false;
+          std::cout << "Removing operation from order: " << *ptr << std::endl;
+          return true;
+      }
+    }
+    return false;
+  }), operations.end());
+}
+
 void PushToThrottle(Operation& operation)
 {
+  // ovewrite anything else in queue (i.e. remove everything else from queue)
+  RemoveFromThrottle(&operation.order);
   throttle.push_back(&operation);
   operation.operationState = OperationState::Queued;
   std::cout << "Operation throttled: " << operation << ", queue size now: " << throttle.size() << std::endl;
+
+  // remove discarded throttled operations from order
+  RemoveDiscardedOperations(operation);
 }
 
 std::vector<Operation*> marketOrders;
 
 void PrintOrderBook()
 {
-  // TODO go through real market order book
   std::map<int, int> bids;
   std::map<int, int> asks;
   for (Operation* operation : marketOrders)
@@ -210,7 +295,7 @@ void PrintOrderBook()
       asks[operation->price] += operation->qty;
     }
   }
-
+  //std::cout << "\033[2J\033[1;1H"; // clear screen
   bool failed = false;
   for (int price = UpperPrice; price > 0; --price)
   {
@@ -242,7 +327,7 @@ void SendToMarket(Operation& operation)
   std::cout << "Operation sent to market, " << operation << std::endl;
 
   if (operation.operationType == OperationType::DeleteOrder)
-    operation.order.orderState = OrderState::Deleting;
+    operation.order.orderState = OrderState::DeleteSentToMarket;
   else
     operation.order.orderState = OrderState::OnMarket;
 
@@ -258,7 +343,7 @@ void SendToMarket(Operation& operation)
       }
       marketOrders.erase(it);
   }
-  // add inserts and amends (so a delete will have already cleared last item)
+  // add inserts and amends (a delete will have already cleared last item)
   if (operation.operationType == OperationType::InsertOrder || operation.operationType == OperationType::AmendOrder)
   {
     marketOrders.push_back(&operation);
@@ -300,9 +385,9 @@ void InsertOrder()
   operation->price = order->price;
   operation->qty = order->qty;
 
-  std::cout << "Order insert, side: " << (order->side == Side::Buy ? "Buy" : "Sell") << ", qty: " << order->qty << ", price: " << order->price << std::endl;
+  std::cout << "Order insert: " << *order << std::endl;
 
-  if (!CheckInsert(*order))
+  if (!CheckPendingInsertOrAmend(*order))
   {
     std::cout << "*** Order insert crossed, rejecting operation: " << *operation << std::endl;
     orders.pop_back();
@@ -317,15 +402,7 @@ void InsertOrder()
   }
 }
 
-void AmendOrder()
-{
-  // TODO
-  // update price/qty immediately
-  // add new operation to order
-  // link this new operation to previous one of order
-}
-
-Order* GetRandomOrder()
+Order* GetRandomLiveOrder()
 {
   std::uniform_int_distribution<> uniform_dist(0, orders.size());
   const int maxAttempts = orders.size();
@@ -344,17 +421,9 @@ Order* GetRandomOrder()
   return nullptr;
 }
 
-void RemoveFromThrottle(Order* order)
-{
-  throttle.erase(std::remove_if(throttle.begin(), throttle.end(), [order](const Operation* operation){ return &operation->order == order;}), throttle.end()) ;
-}
-
-void DeleteOrder()
+void DeleteOrder(Order* order)
 {
   // mark as deleted (so we don't consider for cross, but still send and wait for ack before removing
-  Order* order = GetRandomOrder();
-  if (!order)
-    return;
   Operation* previousOperation = order->operations.back().get();
   order->operations.push_back(std::unique_ptr<Operation>(new Operation(*order)));
   Operation* operation = order->operations.back().get();
@@ -363,19 +432,24 @@ void DeleteOrder()
   operation->operationState = OperationState::Initial;
   operation->price = order->price;
   operation->qty = order->qty;
-  std::cout << "Order delete, order state: " <<  (int)order->orderState << ", side: " << (order->side == Side::Buy ? "Buy" : "Sell") << ", qty: " << order->qty << ", price: " << order->price << ", previous operation: " << *previousOperation << std::endl;
+  std::cout << "Order delete, [" << *order << "] , previous operation: " << *previousOperation << std::endl;
 
   // if order is not live (i.e. queued), can remove right now
   if (order->orderState == OrderState::PriorToMarket)
   {
       RemoveFromThrottle(order);
-      order->orderState = OrderState::Deleted;
+      order->orderState = OrderState::Finalised;
       auto it = std::find_if(orders.begin(), orders.end(), [order](const std::unique_ptr<Order>& ptr) { return ptr.get() == order; });
       orders.erase(it);
       return;
   }
 
-  order->orderState = OrderState::Deleting;
+  // remove any queued items
+  RemoveFromThrottle(order);
+  // remove discarded throttled operations from order
+  RemoveDiscardedOperations(*operation);
+
+  order->orderState = OrderState::DeleteSentToMarket;
 
   if (!CheckThrottle())
   {
@@ -387,15 +461,54 @@ void DeleteOrder()
   }
 }
 
+void AmendOrder()
+{
+  // update price/qty of order immediately
+  Order* order = GetRandomLiveOrder();
+  if (!order)
+    return;
+  order->price = RandomPrice();
+  order->qty = RandomQty();
+  Operation* previousOperation = order->operations.back().get();
+  order->operations.push_back(std::unique_ptr<Operation>(new Operation(*order)));
+  Operation* operation = order->operations.back().get();
+  operation->previousOperation = previousOperation;
+  operation->operationType = OperationType::AmendOrder;
+  operation->operationState = OperationState::Initial;
+  operation->price = order->price;
+  operation->qty = order->qty;
+  std::cout << "Order amend to " << order->qty << "@" << order->price << " [" << *order << "], previous operation: " << *previousOperation << std::endl;
+
+  if (!CheckPendingInsertOrAmend(*order))
+  {
+    std::cout << "*** Order amend crossed, rejecting operation: " << *operation << std::endl;
+    order->operations.pop_back();
+    // clear up order (on market and/or in queue)
+    DeleteOrder(order);
+  }
+  else if (!CheckThrottle())
+  {
+     PushToThrottle(*operation);
+  }
+  else
+  {
+    assert(previousOperation->operationState != OperationState::Queued);
+    SendToMarket(*operation);
+  }
+}
+
 void Quote()
 {
   // TODO
   // update global quote state immediately, but still send operations
+  // (i.e. check for cross, then either throttle or send)
 }
 
 void DeleteQuote()
 {
   // TODO
+  // update global state
+  // either throttle or send
 }
 
 void PerformAction(Action action)
@@ -406,7 +519,11 @@ void PerformAction(Action action)
       InsertOrder();
       break;
     case Action::DELETE_ORDER:
-      DeleteOrder();
+      {
+      Order* order = GetRandomLiveOrder();
+        if (order)
+          DeleteOrder(order);
+      }
       break;
     case Action::AMEND_ONCE:
     case Action::AMEND_TWICE:
@@ -448,7 +565,7 @@ void AckOrderOperations()
   int itemsAcked = 0;
   for (auto& order : orders)
   {
-    if (order->orderState == OrderState::Deleted)
+    if (order->orderState == OrderState::Finalised)
       continue;
     for (auto& operation : order->operations)
     {
@@ -460,12 +577,12 @@ void AckOrderOperations()
         operation->operationState = OperationState::Acked;
         if (operation->operationType == OperationType::DeleteOrder)
         {
-          order->orderState = OrderState::Deleted;
+          order->orderState = OrderState::Finalised;
         }
         else
         {
           // only mark as on market if we haven't already marked this as deleting
-          if (order->orderState != OrderState::Deleting)
+          if (order->orderState != OrderState::DeleteSentToMarket)
             order->orderState = OrderState::OnMarket;
         }
 
@@ -477,6 +594,14 @@ void AckOrderOperations()
 
 void ProcessThrottleQueue()
 {
+  if (throttle.empty())
+    return;
+
+  std::cout << "Throttle queue contains: ";
+  for (auto& operation : throttle)
+    std::cout << *operation;
+  std::cout << std::endl;
+
   std::uniform_int_distribution<> distribution(0, MaxOperationsToClearFromQueue);
   int window = distribution(random_engine);
   // deletes first
@@ -520,7 +645,7 @@ int main()
 
     // only clear memory once and a while
     if (orders.size() > 1000)
-      orders.erase(std::remove_if(orders.begin(), orders.end(), [](const std::unique_ptr<Order>& ptr) { return ptr->orderState == OrderState::Deleted; }), orders.end());
+      orders.erase(std::remove_if(orders.begin(), orders.end(), [](const std::unique_ptr<Order>& ptr) { return ptr->orderState == OrderState::Finalised; }), orders.end());
   }
 }
 
