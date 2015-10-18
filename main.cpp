@@ -186,7 +186,6 @@ bool CheckPendingInsertOrAmend(Order& pendingOrder)
     int lowestUnackedPrice = std::numeric_limits<int>::max();
     for (auto& quoteOperation : quotes->operations)
     {
-      std::cout << *quoteOperation.get() << std::endl;
       if (quoteOperation->askQty == -1)
         continue; // no active quote
       if (quoteOperation->operationState == OperationState::Acked)
@@ -571,6 +570,8 @@ bool CheckPendingQuote(Operation* quoteOperation)
   // walk through all orders and check that not in cross
   for (auto& order: orders)
   {
+    if (order->isQuote)
+      continue; // special quote entry
     if (order->orderState == OrderState::Finalised)
       continue; // can't be in cross if other order is gone
     if (order->orderState == OrderState::DeleteSentToMarket)
