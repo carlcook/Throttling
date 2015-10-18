@@ -33,8 +33,8 @@ enum class Action
 enum class OrderState
 {
   PriorToMarket,
-  OnMarket,
-  DeleteSentToMarket, // delete sent to market
+  OnMarket, // sent to market, possibly not yet acknowledged
+  DeleteSentToMarket,
   Finalised // gone
 };
 
@@ -376,6 +376,7 @@ void SendToMarket(Operation& operation)
   operation.operationState = OperationState::SentToMarket;
   std::cout << "Operation sent to market, " << operation << std::endl;
 
+  // update order manager
   if (operation.operationType == OperationType::DeleteOrder || operation.operationType == OperationType::DeleteQuote)
     operation.order.orderState = OrderState::DeleteSentToMarket;
   else
@@ -560,8 +561,44 @@ void AmendOrder()
 
 void DeleteQuote()
 {
-  // TODO
-  // either throttle or send (but leave global quote object)
+  if (quotes->orderState == OrderState::DeleteSentToMarket || quotes->orderState == OrderState::Finalised)
+    return; // nothing to delete
+  Operation* previousOperation = quotes->operations.back().get();
+  quotes->operations.push_back(std::unique_ptr<Operation>(new Operation(*quotes)));
+  Operation* deleteQuoteOperation = quotes->operations.back().get();
+  deleteQuoteOperation->previousOperation = previousOperation;
+  deleteQuoteOperation->operationType = OperationType::DeleteQuote;
+  deleteQuoteOperation->operationState = OperationState::Initial;
+  deleteQuoteOperation->askPrice = 0;
+  deleteQuoteOperation->askQty = -1;
+  deleteQuoteOperation->bidPrice = 0;
+  deleteQuoteOperation->bidQty = -1;
+  std::cout << "Quote delete, [" << *deleteQuoteOperation << "] , previous operation: " << *previousOperation << std::endl;
+
+  // if quote is not live (i.e. queued), we can remove right now
+  if (quotes->orderState == OrderState::PriorToMarket)
+  {
+      RemoveFromThrottle(quotes);
+      quotes->orderState = OrderState::Finalised;
+      return;
+  }
+
+  // remove any queued items
+  RemoveFromThrottle(quotes);
+  // remove discarded throttled operations from quote
+  RemoveDiscardedOperations(*deleteQuoteOperation);
+
+  quotes->orderState = OrderState::DeleteSentToMarket;
+
+  if (!CheckThrottle())
+  {
+     std::cout << "Throttle closed for quote delete" << std::endl;
+     PushToThrottle(*deleteQuoteOperation);
+  }
+  else
+  {
+    SendToMarket(*deleteQuoteOperation);
+  }
 }
 
 bool CheckPendingQuote(Operation* quoteOperation)
@@ -619,9 +656,11 @@ void InitQuotes()
 void Quote()
 {
   // A quote as just another order that stays alive and is two sided. So we need
-  // to check all outstanding quote operations, not just current (due to throttling)
+  // to check all outstanding quote operations prior to insert (due to throttling)
+
+  // if this is an insert, link it to the previous (this helps out the market order book)
   Operation* previousOperation = nullptr;
-  if (!quotes->operations.empty())
+  if (!quotes->operations.empty() && quotes->operations.back()->operationType == OperationType::InsertQuote)
   {
      previousOperation = quotes->operations.back().get();
   }
