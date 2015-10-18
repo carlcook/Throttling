@@ -70,6 +70,11 @@ struct Operation
   OperationState operationState;
   int price;
   int qty;
+  bool isQuote = false;
+  int bidPrice;
+  int bidQty;
+  int askPrice;
+  int askQty;
 };
 
 enum class Side
@@ -103,8 +108,15 @@ std::ostream& operator<<(std::ostream& stream, const Operation& operation)
     {OperationState::Acked, "Acked"}
   };
 
-  stream << "Type: " << typeMap[operation.operationType] << ", state: " << stateMap[operation.operationState]
-         << ", " << operation.qty << "@" << operation.price;
+  stream << "Type: " << typeMap[operation.operationType] << ", state: " << stateMap[operation.operationState] << ", ";
+  if (operation.isQuote)
+  {
+    stream << operation.bidQty << "@" << operation.bidPrice << "--" << operation.askQty << "@" << operation.askPrice;
+  }
+  else
+  {
+    stream << operation.qty << "@" << operation.price;
+  }
   return stream;
 }
 
@@ -178,6 +190,7 @@ bool CheckPendingInsertOrAmend(Order& pendingOrder)
       int pendingBuyPrice = GetLivePrice([](int a, int b) { return std::max(a, b); }, pendingOrder);
       if (pendingBuyPrice >= lastQuoteAskQty)
       {
+        std::cout << "* Buy order crosses with existing quote" << std::endl;
         return false; // will cross with quote
       }
     }
@@ -189,6 +202,7 @@ bool CheckPendingInsertOrAmend(Order& pendingOrder)
       int pendingAskPrice = GetLivePrice([](int a, int b) { return std::min(a, b); }, pendingOrder);
       if (pendingAskPrice <= lastQuoteBidQty)
       {
+        std::cout << "* Sell order crosses with existing quote" << std::endl;
         return false; // will cross with quote
       }
     }
@@ -210,6 +224,8 @@ bool CheckPendingInsertOrAmend(Order& pendingOrder)
       int minSubmittedSell = GetLivePrice([](int a, int b){return std::min(a, b);}, *order.get());
       if (pendingBuy < minSubmittedSell)
         continue;
+      else
+        std::cout << "* Buy order crosses with existing order" << std::endl;
     }
     else // order must be opposing side if we are here
     {
@@ -217,6 +233,8 @@ bool CheckPendingInsertOrAmend(Order& pendingOrder)
       int maxSubmittedBuy = GetLivePrice([](int a, int b){return std::max(a, b);}, *order.get());
       if (pendingSell > maxSubmittedBuy)
         continue;
+      else
+        std::cout << "* Sell order crosses with existing order" << std::endl;
     }
     return false;
   }
@@ -279,6 +297,7 @@ void PushToThrottle(Operation& operation)
 }
 
 std::vector<Operation*> marketOrders;
+Operation* marketQuote = nullptr;
 
 void PrintOrderBook()
 {
@@ -295,6 +314,15 @@ void PrintOrderBook()
       asks[operation->price] += operation->qty;
     }
   }
+
+  if (marketQuote)
+  {
+    if (marketQuote->bidQty > -1)
+      bids[marketQuote->bidPrice] += marketQuote->bidQty;
+    if (marketQuote->askQty > -1)
+      asks[marketQuote->askPrice] += marketQuote->askQty;
+  }
+
   //std::cout << "\033[2J\033[1;1H"; // clear screen
   bool failed = false;
   for (int price = UpperPrice; price > 0; --price)
@@ -326,6 +354,7 @@ void SendToMarket(Operation& operation)
   operation.operationState = OperationState::SentToMarket;
   std::cout << "Operation sent to market, " << operation << std::endl;
 
+  // TODO handle quotes here as well
   if (operation.operationType == OperationType::DeleteOrder)
     operation.order.orderState = OrderState::DeleteSentToMarket;
   else
@@ -348,13 +377,23 @@ void SendToMarket(Operation& operation)
   {
     marketOrders.push_back(&operation);
   }
+  if (operation.operationType == OperationType::InsertQuote)
+  {
+    // overwrite old quote
+    marketQuote = &operation;
+  }
   PrintOrderBook();
+}
+
+int RandomPrice(int lower, int upper)
+{
+  std::uniform_int_distribution<> distribution(lower, upper);
+  return distribution(random_engine);
 }
 
 int RandomPrice()
 {
-  std::uniform_int_distribution<> distribution(1, UpperPrice);
-  return distribution(random_engine);
+  return RandomPrice(1, UpperPrice);
 }
 
 int RandomQty()
@@ -394,6 +433,7 @@ void InsertOrder()
   }
   else if (!CheckThrottle())
   {
+     std::cout << "Throttle closed" << std::endl;
      PushToThrottle(*operation);
   }
   else
@@ -453,6 +493,7 @@ void DeleteOrder(Order* order)
 
   if (!CheckThrottle())
   {
+     std::cout << "Throttle closed" << std::endl;
      PushToThrottle(*operation);
   }
   else
@@ -488,6 +529,7 @@ void AmendOrder()
   }
   else if (!CheckThrottle())
   {
+     std::cout << "Throttle closed" << std::endl;
      PushToThrottle(*operation);
   }
   else
@@ -497,18 +539,94 @@ void AmendOrder()
   }
 }
 
-void Quote()
-{
-  // TODO
-  // update global quote state immediately, but still send operations
-  // (i.e. check for cross, then either throttle or send)
-}
+Order quote;
 
 void DeleteQuote()
 {
   // TODO
   // update global state
   // either throttle or send
+}
+
+bool CheckPendingQuote(Operation* operation)
+{
+  // we assume that quotes won't cross with each other
+  // walk through all orders and check that not in cross
+  for (auto& order: orders)
+  {
+    if (order->orderState == OrderState::Finalised)
+      continue; // can't be in cross if other order is gone
+    if (order->orderState == OrderState::DeleteSentToMarket)
+      continue; // can't be in cross if other order is going
+
+    if (order->side == Side::Buy)
+    {
+      if (lastQuoteAskQty > -1)
+      {
+        int minSubmittedSell = GetLivePrice([](int a, int b){return std::min(a, b);}, *order.get());
+        if (operation->askPrice > minSubmittedSell)
+          continue;
+        else
+          std::cout << "* Quote ask crosses with existing order" << std::endl;
+      }
+    }
+    else // sell order
+    {
+      if (lastQuoteBidQty > -1)
+      {
+        int maxSubmittedBuy = GetLivePrice([](int a, int b){return std::max(a, b);}, *order.get());
+        if (operation->bidPrice < maxSubmittedBuy)
+          continue;
+        else
+          std::cout << "* Quote bid crosses with existing order" << std::endl;
+      }
+    }
+    return false; // the quote crossed with an order
+  }
+  return true;
+}
+
+void Quote()
+{
+  // TODO have a quote as just another order that stays alive and is two sided. So we need
+  // to check all outstanding quote operations, not just current (due to throttling)
+
+  // create an "unowned" operation to send to the market
+  std::unique_ptr<Operation> operation(new Operation(quote));
+  operation->isQuote = true;
+  operation->operationState = OperationState::Initial;
+  operation->operationType = OperationType::InsertQuote;
+  operation->bidPrice = RandomPrice(1, UpperPrice - 1);
+  operation->bidQty = RandomQty();
+  operation->askPrice = RandomPrice(operation->bidPrice + 1, UpperPrice);
+  operation->askQty = RandomQty();
+
+  std::cout << "Quote insert: " << *operation.get() << std::endl;
+
+  // check that quote isn't in cross. If it is, delete previous quote
+  if (!CheckPendingQuote(operation.get()))
+  {
+    DeleteQuote();
+    return;
+  }
+
+  // update global state now that the order has been submitted
+  lastQuoteBidPrice = operation->bidPrice;
+  lastQuoteBidQty = operation->bidQty;
+  lastQuoteAskPrice = operation->askPrice;
+  lastQuoteAskQty = operation->askQty;
+
+  // record quote
+  quote.operations.push_back(std::move(operation));
+
+  if (!CheckThrottle())
+  {
+     std::cout << "Throttle closed" << std::endl;
+    // add to throttle and conflate any other quote operations (including deletes)
+    PushToThrottle(*quote.operations.back().get());
+    return;
+  }
+  SendToMarket(*quote.operations.back().get());
 }
 
 void PerformAction(Action action)
@@ -646,6 +764,8 @@ int main()
     // only clear memory once and a while
     if (orders.size() > 1000)
       orders.erase(std::remove_if(orders.begin(), orders.end(), [](const std::unique_ptr<Order>& ptr) { return ptr->orderState == OrderState::Finalised; }), orders.end());
+
+    // TODO clear quote memory (all acked quotes except the last, or every time a quote delete is acked)
   }
 }
 
